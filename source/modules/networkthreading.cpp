@@ -11,6 +11,7 @@
 #include <mutex>
 #include "sourcesdk/proto_oob.h"
 #include "steam/steam_gameserver.h"
+#include <eiface.h>
 
 // memdbgon must be the last include file in a .cpp file!!!
 #include "tier0/memdbgon.h"
