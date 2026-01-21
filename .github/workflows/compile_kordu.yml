@@ -1,0 +1,82 @@
+name: Build Kordu (Linux 32-bit)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/compile_kordu.yml'
+      - 'source/**'
+      - 'premake5.lua'
+      - '!source/public/README.md'
+
+jobs:
+  build_holylib_linux32:
+    name: "Build HolyLib (Linux 32-bit)"
+    uses: RaphaelIT7/gmod-common-module-base/.github/workflows/compile.yml@workflow
+    with:
+      PROJECT_NAME: "holylib"
+      BUILD_64x: "false"
+      BUILD_32x: "true"
+      REALM: "sv"
+      LINUX_FILEEXTENTION: "so"
+      BUILD_WINDOWS: "false"
+      ARTIFACT_EXPIRE: "30"
+      SOURCESDK_MINIMAL: "RaphaelIT7/sourcesdk-minimal"
+      SOURCESDK_MINIMAL_BRANCH: "patch-7"
+      GARRYSMOD_COMMON: "RaphaelIT7/garrysmod_common"
+      BUILD_CACHE: "true"
+
+  build_ghostinj_linux32:
+    name: "Build GhostInj (Linux 32-bit)"
+    uses: RaphaelIT7/gmod-common-module-base/.github/workflows/compile.yml@workflow
+    with:
+      PROJECT_PATH: "ghostinj-dll/"
+      PROJECT_NAME: "ghostinj"
+      BUILD_64x: "false"
+      BUILD_32x: "true"
+      LINUX_FILEEXTENTION: "dll"
+      BUILD_WINDOWS: "false"
+      USE_PREFIX: "false"
+      ARTIFACT_EXPIRE: "30"
+      SOURCESDK_MINIMAL: "RaphaelIT7/sourcesdk-minimal"
+      SOURCESDK_MINIMAL_BRANCH: "patch-7"
+      GARRYSMOD_COMMON: "RaphaelIT7/garrysmod_common"
+      BUILD_CACHE: "true"
+
+  package_kordu:
+    name: "Package Kordu Build"
+    needs: [build_holylib_linux32, build_ghostinj_linux32]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        name: "Checkout VDF file"
+        with:
+          sparse-checkout: holylib.vdf
+
+      - uses: actions/download-artifact@v4
+        name: "Download HolyLib"
+        with:
+          name: "gmsv_holylib_linux.so"
+
+      - uses: actions/download-artifact@v4
+        name: "Download GhostInj"
+        with:
+          name: "ghostinj.dll"
+
+      - name: "Create package structure"
+        run: |
+          mkdir -p garrysmod/lua/bin
+          mkdir -p garrysmod/addons
+
+          mv gmsv_holylib_linux.so garrysmod/lua/bin/
+          mv holylib.vdf garrysmod/addons/
+
+          tar -czf holylib_kordu_linux32.tar.gz ghostinj.dll garrysmod/
+
+      - uses: actions/upload-artifact@v4
+        name: "Upload Kordu Package"
+        with:
+          name: holylib_kordu_linux32
+          path: holylib_kordu_linux32.tar.gz
+          compression-level: 9
+          retention-days: 30
