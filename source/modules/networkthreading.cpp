@@ -1,3 +1,4 @@
+#include "filesystem_base.h" // Has to be before symbols.h
 #include "LuaInterface.h"
 #include "detours.h"
 #include "module.h"
@@ -9,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include "sourcesdk/proto_oob.h"
+#include "steam/steam_gameserver.h"
 
 // memdbgon must be the last include file in a .cpp file!!!
 #include "tier0/memdbgon.h"
@@ -37,6 +39,30 @@ IModule* pNetworkThreadingModule = &g_pNetworkThreadingModule;
 
 static ConVar networkthreading_parallelprocessing("holylib_networkthreading_parallelprocessing", "0", 0, "If enabled, some packets will be processed by the networking thread instead of the main thread");
 static ConVar networkthreading_forcechallenge("holylib_networkthreading_forcechallenge", "0", 0, "If enabled, clients are ALWAYS requested to have a challenge for A2S requests.");
+
+// Query response customization
+static ConVar networkthreading_queryresponse("holylib_networkthreading_queryresponse", "0", 0, "If enabled, A2S_INFO responses can be customized via the HolyLib_QueryResponse hook");
+static ConVar networkthreading_queryresponse_cachetime("holylib_networkthreading_queryresponse_cachetime", "5", 0, "How often (in seconds) the query response cache is rebuilt");
+static ConVar networkthreading_queryresponse_luahook("holylib_networkthreading_queryresponse_luahook", "0", 0, "If enabled, the HolyLib_QueryResponse Lua hook is called when rebuilding the cache");
+
+// Thread-safe query response cache
+static std::shared_mutex g_pQueryResponseMutex;
+static char g_pQueryResponseBuffer[1024];
+static bf_write g_pQueryResponsePacket(g_pQueryResponseBuffer, sizeof(g_pQueryResponseBuffer));
+static std::atomic<bool> g_bQueryResponseValid = false;
+static std::atomic<float> g_flQueryResponseLastUpdate = 0.0f;
+static std::atomic<bool> g_bQueryResponseNeedsRebuild = true;
+
+// Cached ConVar values for network thread (avoid ConVar::GetBool() overhead in hot path)
+static std::atomic<bool> g_bQueryResponseEnabled = false;
+static std::atomic<float> g_flQueryResponseCacheTime = 5.0f;
+
+// Static info that doesn't change per-map
+static std::string g_strGameDir;
+static std::string g_strGameDesc;
+static std::string g_strGameVersion;
+static int32_t g_nMaxClients = 0;
+static int32_t g_nUDPPort = 0;
 
 // NOTE: There is inside gcsteamdefines.h the AUTO_LOCK_WRITE which we could probably use
 //static CThreadRWLock g_pIPFilterMutex; // Idk if using a std::shared_mutex might be faster
@@ -225,6 +251,308 @@ static std::atomic<int> g_nThreadState = NetworkThreadState::STATE_NOTRUNNING;
 static Symbols::NET_GetPacket func_NET_GetPacket;
 static Symbols::Filter_SendBan func_Filter_SendBan;
 static Symbols::NET_FindNetChannel func_NET_FindNetChannel;
+
+// Query response cache - called from network thread (HOT PATH - highly optimized)
+static inline bool SendCachedQueryResponse(netpacket_s* pPacket, int nSocket)
+{
+	// Fast path: check atomics only (no ConVar access, no pointer derefs)
+	if (!g_bQueryResponseValid.load(std::memory_order_relaxed))
+		return false;
+
+	// Read lock for thread-safe cache access
+	std::shared_lock<std::shared_mutex> readLock(g_pQueryResponseMutex);
+
+	func_NET_SendPacket(NULL, nSocket, pPacket->from,
+		g_pQueryResponsePacket.GetData(), g_pQueryResponsePacket.GetNumBytesWritten(), nullptr, false);
+
+	return true;
+}
+
+// Called from main thread to rebuild the query response cache
+static void BuildQueryResponseCache()
+{
+	if (!Util::server || !Util::engineserver)
+		return;
+
+	CBaseServer* pServer = (CBaseServer*)Util::server;
+
+	// Use std::string for values that may come from Lua (string lifetime safety)
+	std::string server_name = pServer->GetName();
+	std::string map_name = pServer->GetMapName();
+	std::string game_dir = g_strGameDir;
+	std::string game_desc = g_strGameDesc;
+	std::string game_version = g_strGameVersion;
+	std::string tags;
+
+	int32_t appid = Util::engineserver->GetAppID();
+	int32_t num_clients = pServer->GetNumClients();
+	int32_t num_fake_clients = pServer->GetNumFakeClients();
+	bool has_password = pServer->GetPassword() != nullptr;
+	int32_t udp_port = g_nUDPPort;
+	uint64_t steamid = 0;
+
+	// Check sv_visiblemaxplayers like serversecure/fastquery
+	static ConVarRef sv_visiblemaxplayers("sv_visiblemaxplayers");
+	int32_t max_players = sv_visiblemaxplayers.IsValid() ? sv_visiblemaxplayers.GetInt() : -1;
+	if (max_players <= 0 || max_players > g_nMaxClients)
+		max_players = g_nMaxClients;
+
+	// Get Steam info if available
+	bool vac_secure = false;
+	ISteamGameServer* pGameServer = SteamGameServer();
+	if (pGameServer)
+		vac_secure = pGameServer->BSecure();
+
+	const CSteamID* pSteamID = Util::engineserver->GetGameServerSteamID();
+	if (pSteamID)
+		steamid = pSteamID->ConvertToUint64();
+
+	// Call Lua hook if enabled (main thread only)
+	if (networkthreading_queryresponse_luahook.GetBool() && g_Lua)
+	{
+		g_Lua->GetField(GarrysMod::Lua::INDEX_GLOBAL, "hook");
+		if (g_Lua->IsType(-1, GarrysMod::Lua::Type::Table))
+		{
+			g_Lua->GetField(-1, "Run");
+			g_Lua->Remove(-2);
+			if (g_Lua->IsType(-1, GarrysMod::Lua::Type::Function))
+			{
+				g_Lua->PushString("HolyLib_QueryResponse");
+
+				// Push info table
+				g_Lua->CreateTable();
+
+				g_Lua->PushString(server_name.c_str());
+				g_Lua->SetField(-2, "server_name");
+
+				g_Lua->PushString(map_name.c_str());
+				g_Lua->SetField(-2, "map_name");
+
+				g_Lua->PushString(game_dir.c_str());
+				g_Lua->SetField(-2, "game_dir");
+
+				g_Lua->PushString(game_desc.c_str());
+				g_Lua->SetField(-2, "game_desc");
+
+				g_Lua->PushNumber(appid);
+				g_Lua->SetField(-2, "appid");
+
+				g_Lua->PushNumber(num_clients);
+				g_Lua->SetField(-2, "num_clients");
+
+				g_Lua->PushNumber(max_players);
+				g_Lua->SetField(-2, "max_players");
+
+				g_Lua->PushNumber(num_fake_clients);
+				g_Lua->SetField(-2, "num_fake_clients");
+
+				g_Lua->PushBool(has_password);
+				g_Lua->SetField(-2, "has_password");
+
+				g_Lua->PushBool(vac_secure);
+				g_Lua->SetField(-2, "vac_secure");
+
+				g_Lua->PushString(game_version.c_str());
+				g_Lua->SetField(-2, "game_version");
+
+				g_Lua->PushNumber(udp_port);
+				g_Lua->SetField(-2, "udp_port");
+
+				g_Lua->PushNumber(static_cast<double>(steamid));
+				g_Lua->SetField(-2, "steamid");
+
+				g_Lua->PushString(tags.c_str());
+				g_Lua->SetField(-2, "tags");
+
+				if (g_Lua->PCall(2, 1, 0) == 0)
+				{
+					// Read ALL modified values from returned table (like fastquery)
+					if (g_Lua->IsType(-1, GarrysMod::Lua::Type::Table))
+					{
+						g_Lua->GetField(-1, "server_name");
+						if (g_Lua->IsType(-1, GarrysMod::Lua::Type::String))
+							server_name = g_Lua->GetString(-1);
+						g_Lua->Pop(1);
+
+						g_Lua->GetField(-1, "map_name");
+						if (g_Lua->IsType(-1, GarrysMod::Lua::Type::String))
+							map_name = g_Lua->GetString(-1);
+						g_Lua->Pop(1);
+
+						g_Lua->GetField(-1, "game_dir");
+						if (g_Lua->IsType(-1, GarrysMod::Lua::Type::String))
+							game_dir = g_Lua->GetString(-1);
+						g_Lua->Pop(1);
+
+						g_Lua->GetField(-1, "game_desc");
+						if (g_Lua->IsType(-1, GarrysMod::Lua::Type::String))
+							game_desc = g_Lua->GetString(-1);
+						g_Lua->Pop(1);
+
+						g_Lua->GetField(-1, "appid");
+						if (g_Lua->IsType(-1, GarrysMod::Lua::Type::Number))
+							appid = static_cast<int32_t>(g_Lua->GetNumber(-1));
+						g_Lua->Pop(1);
+
+						g_Lua->GetField(-1, "num_clients");
+						if (g_Lua->IsType(-1, GarrysMod::Lua::Type::Number))
+							num_clients = static_cast<int32_t>(g_Lua->GetNumber(-1));
+						g_Lua->Pop(1);
+
+						g_Lua->GetField(-1, "max_players");
+						if (g_Lua->IsType(-1, GarrysMod::Lua::Type::Number))
+							max_players = static_cast<int32_t>(g_Lua->GetNumber(-1));
+						g_Lua->Pop(1);
+
+						g_Lua->GetField(-1, "num_fake_clients");
+						if (g_Lua->IsType(-1, GarrysMod::Lua::Type::Number))
+							num_fake_clients = static_cast<int32_t>(g_Lua->GetNumber(-1));
+						g_Lua->Pop(1);
+
+						g_Lua->GetField(-1, "has_password");
+						if (g_Lua->IsType(-1, GarrysMod::Lua::Type::Bool))
+							has_password = g_Lua->GetBool(-1);
+						g_Lua->Pop(1);
+
+						g_Lua->GetField(-1, "vac_secure");
+						if (g_Lua->IsType(-1, GarrysMod::Lua::Type::Bool))
+							vac_secure = g_Lua->GetBool(-1);
+						g_Lua->Pop(1);
+
+						g_Lua->GetField(-1, "game_version");
+						if (g_Lua->IsType(-1, GarrysMod::Lua::Type::String))
+							game_version = g_Lua->GetString(-1);
+						g_Lua->Pop(1);
+
+						g_Lua->GetField(-1, "udp_port");
+						if (g_Lua->IsType(-1, GarrysMod::Lua::Type::Number))
+							udp_port = static_cast<int32_t>(g_Lua->GetNumber(-1));
+						g_Lua->Pop(1);
+
+						g_Lua->GetField(-1, "steamid");
+						if (g_Lua->IsType(-1, GarrysMod::Lua::Type::Number))
+							steamid = static_cast<uint64_t>(g_Lua->GetNumber(-1));
+						g_Lua->Pop(1);
+
+						g_Lua->GetField(-1, "tags");
+						if (g_Lua->IsType(-1, GarrysMod::Lua::Type::String))
+							tags = g_Lua->GetString(-1);
+						g_Lua->Pop(1);
+					}
+				}
+				else
+				{
+					// PCall failed, log error
+					if (g_Lua->IsType(-1, GarrysMod::Lua::Type::String))
+						ConDMsg(PROJECT_NAME " - networkthreading: HolyLib_QueryResponse hook error: %s\n", g_Lua->GetString(-1));
+				}
+				g_Lua->Pop(1);
+			}
+			else
+			{
+				g_Lua->Pop(1);
+			}
+		}
+		else
+		{
+			g_Lua->Pop(1);
+		}
+	}
+
+	// Build the packet with write lock (all strings are now safely copied)
+	{
+		std::unique_lock<std::shared_mutex> writeLock(g_pQueryResponseMutex);
+
+		bool has_tags = !tags.empty();
+
+		g_pQueryResponsePacket.Reset();
+		g_pQueryResponsePacket.WriteLong(-1);  // Connectionless header
+		g_pQueryResponsePacket.WriteByte('I'); // A2S_INFO response
+		g_pQueryResponsePacket.WriteByte(17);  // Protocol version
+		g_pQueryResponsePacket.WriteString(server_name.c_str());
+		g_pQueryResponsePacket.WriteString(map_name.c_str());
+		g_pQueryResponsePacket.WriteString(game_dir.c_str());
+		g_pQueryResponsePacket.WriteString(game_desc.c_str());
+		g_pQueryResponsePacket.WriteShort(static_cast<short>(appid));
+		g_pQueryResponsePacket.WriteByte(static_cast<unsigned char>(num_clients));
+		g_pQueryResponsePacket.WriteByte(static_cast<unsigned char>(max_players));
+		g_pQueryResponsePacket.WriteByte(static_cast<unsigned char>(num_fake_clients));
+		g_pQueryResponsePacket.WriteByte('d'); // Dedicated server
+#ifdef _WIN32
+		g_pQueryResponsePacket.WriteByte('w'); // Windows
+#else
+		g_pQueryResponsePacket.WriteByte('l'); // Linux
+#endif
+		g_pQueryResponsePacket.WriteByte(has_password ? 1 : 0);
+		g_pQueryResponsePacket.WriteByte(vac_secure ? 1 : 0);
+		g_pQueryResponsePacket.WriteString(game_version.c_str());
+
+		// EDF (Extra Data Flag)
+		// 0x80 - port number is present
+		// 0x10 - server steamid is present
+		// 0x20 - tags are present
+		// 0x01 - game long appid is present
+		uint8_t edf = 0x80 | 0x10 | (has_tags ? 0x20 : 0x00) | 0x01;
+		g_pQueryResponsePacket.WriteByte(edf);
+		g_pQueryResponsePacket.WriteShort(static_cast<short>(udp_port));
+		g_pQueryResponsePacket.WriteLongLong(static_cast<int64_t>(steamid));
+		if (has_tags)
+			g_pQueryResponsePacket.WriteString(tags.c_str());
+		g_pQueryResponsePacket.WriteLongLong(static_cast<int64_t>(appid));
+
+		g_bQueryResponseValid.store(true);
+	}
+
+	g_flQueryResponseLastUpdate.store(static_cast<float>(Plat_FloatTime()));
+	g_bQueryResponseNeedsRebuild.store(false);
+}
+
+// Initialize static query response info
+static void InitQueryResponseInfo()
+{
+	if (!Util::server || !Util::engineserver || !Util::servergamedll)
+		return;
+
+	CBaseServer* pServer = (CBaseServer*)Util::server;
+
+	// Get game directory
+	char szGameDir[256];
+	Util::engineserver->GetGameDir(szGameDir, sizeof(szGameDir));
+	g_strGameDir = szGameDir;
+	size_t pos = g_strGameDir.find_last_of("\\/");
+	if (pos != std::string::npos)
+		g_strGameDir.erase(0, pos + 1);
+
+	// Get game description
+	g_strGameDesc = Util::servergamedll->GetGameDescription();
+
+	// Get max clients and port
+	g_nMaxClients = pServer->GetMaxClients();
+	g_nUDPPort = pServer->GetUDPPort();
+
+	// Get game version from steam.inf
+	g_strGameVersion = "2.0.0.0";
+	FileHandle_t file = g_pFullFileSystem->Open("steam.inf", "r", "GAME");
+	if (file)
+	{
+		char buff[256];
+		if (g_pFullFileSystem->ReadLine(buff, sizeof(buff), file))
+		{
+			// Line format: PatchVersion=2.X.X.X
+			if (strlen(buff) > 13)
+			{
+				g_strGameVersion = &buff[13];
+				size_t endpos = g_strGameVersion.find_first_of("\r\n");
+				if (endpos != std::string::npos)
+					g_strGameVersion.erase(endpos);
+			}
+		}
+		g_pFullFileSystem->Close(file);
+	}
+
+	g_bQueryResponseNeedsRebuild.store(true);
+}
+
 static SIMPLETHREAD_RETURNVALUE NetworkThread(void* pThreadData)
 {
 	if (!Util::server || !func_NET_GetPacket || !func_Filter_SendBan || !func_NET_FindNetChannel)
@@ -264,6 +592,26 @@ static SIMPLETHREAD_RETURNVALUE NetworkThread(void* pThreadData)
 				packet->message.ReadLong();	// read the -1
 				if (EnforceConnectionlessChallenge(packet))
 					continue;
+
+				// Check if this is an A2S_INFO request and we should send cached response
+				// Uses cached atomics for ConVar values (avoid ConVar::GetBool() in hot path)
+				if (g_bQueryResponseEnabled.load(std::memory_order_relaxed) && packet->size >= 5)
+				{
+					char queryType = packet->data[4];
+					if (queryType == A2S_INFO)
+					{
+						// Check if cache is valid and send cached response
+						if (SendCachedQueryResponse(packet, nSocket))
+						{
+							// Flag that cache should be rebuilt if enough time passed
+							float timeSinceUpdate = static_cast<float>(Plat_FloatTime()) - g_flQueryResponseLastUpdate.load(std::memory_order_relaxed);
+							if (timeSinceUpdate >= g_flQueryResponseCacheTime.load(std::memory_order_relaxed))
+								g_bQueryResponseNeedsRebuild.store(true, std::memory_order_relaxed);
+
+							continue; // We handled it
+						}
+					}
+				}
 
 				if (net_showudp.GetInt())
 					Msg("UDP <- %s: sz=%i OOB '%c' wire=%i\n", packet->from.ToString(), packet->size, packet->data[4], packet->wiresize);
@@ -382,6 +730,17 @@ void CNetworkThreadingModule::Think(bool bSimulating)
 	CBaseServer* pServer = (CBaseServer*)Util::server;
 	if (pServer)
 		g_nChallengeNr.store(pServer->m_CurrentRandomNonce);
+
+	// Sync ConVar values to atomics for network thread (avoids ConVar access in hot path)
+	bool bQueryEnabled = networkthreading_queryresponse.GetBool();
+	g_bQueryResponseEnabled.store(bQueryEnabled, std::memory_order_relaxed);
+	g_flQueryResponseCacheTime.store(networkthreading_queryresponse_cachetime.GetFloat(), std::memory_order_relaxed);
+
+	// Rebuild query response cache if needed (main thread for Lua hook)
+	if (bQueryEnabled && g_bQueryResponseNeedsRebuild.load(std::memory_order_relaxed))
+	{
+		BuildQueryResponseCache();
+	}
 }
 
 static ThreadHandle_t g_pNetworkThread = nullptr;
@@ -390,6 +749,18 @@ void CNetworkThreadingModule::ServerActivate(edict_t* pEdictList, int edictCount
 	CBaseServer* pServer = (CBaseServer*)Util::server;
 	if (pServer)
 		g_nChallengeNr.store(pServer->m_CurrentRandomNonce);
+
+	// Sync ConVar values to atomics
+	bool bQueryEnabled = networkthreading_queryresponse.GetBool();
+	g_bQueryResponseEnabled.store(bQueryEnabled, std::memory_order_relaxed);
+	g_flQueryResponseCacheTime.store(networkthreading_queryresponse_cachetime.GetFloat(), std::memory_order_relaxed);
+
+	// Initialize query response cache
+	if (bQueryEnabled)
+	{
+		InitQueryResponseInfo();
+		BuildQueryResponseCache();
+	}
 
 	g_nThreadState.store(NetworkThreadState::STATE_RUNNING);
 	if (g_pNetworkThread == nullptr)
@@ -401,6 +772,10 @@ void CNetworkThreadingModule::ServerActivate(edict_t* pEdictList, int edictCount
 
 void CNetworkThreadingModule::LevelShutdown()
 {
+	// Invalidate query response cache on map change
+	g_bQueryResponseValid.store(false);
+	g_bQueryResponseNeedsRebuild.store(true);
+
 	if (g_pNetworkThread == nullptr)
 		return;
 
